@@ -1,0 +1,8 @@
+# Story Video Creator Configuration
+# Edit these paths as needed
+
+PIPER_PATH=piper\piper.exe
+VOICE_MODEL=voices\en_US-lessac-high.onnx
+
+# Example usage:
+# python story_video_creator.py sample_story.txt backgrounds/ output.mp4 --piper-path "piper\piper.exe" --voice-model "voices\en_US-lessac-high.onnx"

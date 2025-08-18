@@ -1,0 +1,5 @@
+# Ignore voices, stories, output, and backgrounds folders
+voices/
+stories/
+output/
+backgrounds/
