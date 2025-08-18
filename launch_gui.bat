@@ -32,8 +32,12 @@ echo Starting Story Video Creator GUI...
 echo Close this window to exit the application.
 echo.
 
-REM Launch the GUI
-python story_video_gui.py
+REM Launch the GUI using the virtual environment's Python
+if exist ".venv\Scripts\python.exe" (
+    .venv\Scripts\python.exe story_video_gui.py
+) else (
+    python story_video_gui.py
+)
 
 echo.
 echo GUI application closed.

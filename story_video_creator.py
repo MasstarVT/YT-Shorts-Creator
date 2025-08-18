@@ -22,6 +22,9 @@ import argparse
 from pathlib import Path
 from typing import Optional
 import tempfile
+import threading
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # MoviePy will be imported when needed to avoid early exit on help commands
 
@@ -37,7 +40,19 @@ class StoryVideoCreator:
         """
         self.piper_path = piper_path
         self.voice_model = voice_model
-        self.temp_dir = tempfile.mkdtemp()
+        # Create a temp directory specifically for this instance
+        self.temp_dir = tempfile.mkdtemp(prefix="story_video_")
+        print(f"Using temp directory: {self.temp_dir}")
+        self._current_story_text = None  # Store current story text for subtitles
+        self._font_cache = {}  # Cache for loaded fonts
+    
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - cleanup temp files"""
+        self.cleanup()
         
     def read_story_file(self, story_file: str) -> str:
         """Read the story content from a text file"""
@@ -69,38 +84,54 @@ class StoryVideoCreator:
             Path to the generated audio file
         """
         try:
-            # Prepare Piper command
-            cmd = [self.piper_path]
+            # Try GPU acceleration first, fallback to CPU if it fails
+            for use_gpu in [True, False]:
+                try:
+                    # Prepare Piper command
+                    cmd = [self.piper_path]
+                    
+                    # Add voice model if specified
+                    if self.voice_model:
+                        cmd.extend(["-m", self.voice_model])
+                    
+                    # Add GPU acceleration if available and this is the first attempt
+                    if use_gpu:
+                        cmd.extend(["--cuda"])  # Try GPU acceleration
+                    
+                    # Add output file
+                    cmd.extend(["-f", output_audio_path])
+                    
+                    print(f"Generating audio with Piper TTS ({'GPU' if use_gpu else 'CPU'})...")
+                    print(f"Command: {' '.join(cmd)}")
+                    
+                    # Run Piper TTS
+                    process = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True
+                    )
+                    
+                    stdout, stderr = process.communicate(input=text)
+                    
+                    if process.returncode == 0 and os.path.exists(output_audio_path):
+                        print(f"Audio generated successfully: {output_audio_path}")
+                        return output_audio_path
+                    elif use_gpu:
+                        print("GPU acceleration failed, trying CPU...")
+                        continue
+                    else:
+                        raise Exception(f"Piper TTS failed: {stderr}")
+                        
+                except Exception as e:
+                    if use_gpu:
+                        print(f"GPU acceleration failed: {e}, trying CPU...")
+                        continue
+                    else:
+                        raise e
             
-            # Add voice model if specified
-            if self.voice_model:
-                cmd.extend(["-m", self.voice_model])
-            
-            # Add output file
-            cmd.extend(["-f", output_audio_path])
-            
-            print(f"Generating audio with Piper TTS...")
-            print(f"Command: {' '.join(cmd)}")
-            
-            # Run Piper TTS
-            process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            stdout, stderr = process.communicate(input=text)
-            
-            if process.returncode != 0:
-                raise Exception(f"Piper TTS failed: {stderr}")
-            
-            if not os.path.exists(output_audio_path):
-                raise Exception("Audio file was not generated")
-            
-            print(f"Audio generated successfully: {output_audio_path}")
-            return output_audio_path
+            raise Exception("Both GPU and CPU attempts failed")
             
         except Exception as e:
             raise Exception(f"Error generating audio with Piper: {e}")
@@ -158,8 +189,8 @@ class StoryVideoCreator:
             
             print("Loading video and audio files...")
             
-            # Load video clip
-            video_clip = VideoFileClip(video_path)
+            # Load video clip with optimized settings
+            video_clip = VideoFileClip(video_path, audio=False)  # Don't load audio from video
             
             # Load audio clip
             audio_clip = AudioFileClip(audio_path)
@@ -171,10 +202,12 @@ class StoryVideoCreator:
             print(f"Video duration: {video_duration:.2f} seconds")
             print(f"Audio duration: {audio_duration:.2f} seconds")
             
+            print("Processing video timing...")
             # Adjust video to match audio duration
             if video_duration < audio_duration:
                 # Loop video if it's shorter than audio
                 loops_needed = int(audio_duration / video_duration) + 1
+                print(f"Looping video {loops_needed} times to match audio duration")
                 video_clip = video_clip.loop(n=loops_needed)
             
             # Cut video to match audio duration
@@ -185,20 +218,29 @@ class StoryVideoCreator:
             
             # Add subtitles if requested
             if add_subtitles:
-                print("Generating subtitles...")
+                print("Generating subtitles (this may take a moment)...")
+                import time
+                start_time = time.time()
                 final_video = self.add_subtitles_to_video(final_video, audio_duration)
+                subtitle_time = time.time() - start_time
+                print(f"Subtitles generated in {subtitle_time:.2f} seconds")
+            else:
+                print("Skipping subtitle generation for faster processing")
             
             print(f"Creating final video: {output_path}")
             
-            # Write the final video
+            # Write the final video with optimized settings
+            temp_audio_file = os.path.join(self.temp_dir, 'temp-audio.m4a')
             final_video.write_videofile(
                 output_path,
                 codec='libx264',
                 audio_codec='aac',
-                temp_audiofile='temp-audio.m4a',
+                temp_audiofile=temp_audio_file,
                 remove_temp=True,
                 verbose=False,
-                logger=None
+                logger=None,
+                preset='fast',  # Balanced speed/quality
+                threads=4  # Use multiple threads
             )
             
             # Clean up
@@ -245,10 +287,12 @@ class StoryVideoCreator:
             # Get video dimensions
             video_width, video_height = video_clip.size
             
-            # Create image clips for subtitles
+            # Create image clips for subtitles using multithreading
             subtitle_clips = []
             
-            for i, chunk in enumerate(subtitle_chunks):
+            def create_subtitle_clip(chunk_data):
+                """Create a single subtitle clip"""
+                i, chunk = chunk_data
                 try:
                     # Create subtitle image
                     subtitle_img = self.create_subtitle_image(
@@ -265,11 +309,27 @@ class StoryVideoCreator:
                         img_clip = ImageClip(subtitle_array, transparent=True)
                         img_clip = img_clip.set_duration(chunk['duration']).set_start(chunk['start'])
                         
-                        subtitle_clips.append(img_clip)
+                        return img_clip
+                    return None
                     
                 except Exception as e:
                     print(f"Warning: Could not create subtitle {i}: {e}")
-                    continue
+                    return None
+            
+            # Use ThreadPoolExecutor for parallel subtitle generation
+            max_workers = min(4, len(subtitle_chunks))  # Limit to 4 threads or number of chunks
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all subtitle creation tasks
+                future_to_chunk = {
+                    executor.submit(create_subtitle_clip, (i, chunk)): i 
+                    for i, chunk in enumerate(subtitle_chunks)
+                }
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_chunk):
+                    clip = future.result()
+                    if clip is not None:
+                        subtitle_clips.append(clip)
             
             if subtitle_clips:
                 # Composite video with subtitles
@@ -290,12 +350,10 @@ class StoryVideoCreator:
     def create_subtitle_image(self, text: str, video_width: int, video_height: int):
         """
         Create a subtitle image using PIL
-        
         Args:
             text: The text to render
             video_width: Width of the video
             video_height: Height of the video
-            
         Returns:
             PIL Image with the subtitle text
         """
@@ -306,21 +364,29 @@ class StoryVideoCreator:
             img = Image.new('RGBA', (video_width, video_height), (0, 0, 0, 0))
             draw = ImageDraw.Draw(img)
             
-            # Try to load a font
-            try:
-                # Try to use a system font
-                font_size = max(24, min(video_width // 25, 48))  # Responsive font size
-                font = ImageFont.truetype("arial.ttf", font_size)
-            except:
+            # Try to load a font with caching
+            font_size = max(24, min(video_width // 25, 48))  # Responsive font size
+            font_key = f"font_{font_size}"
+            
+            if font_key in self._font_cache:
+                font = self._font_cache[font_key]
+            else:
                 try:
-                    # Fallback to different font names
-                    font = ImageFont.truetype("Arial.ttf", font_size)
+                    # Try to use a system font
+                    font = ImageFont.truetype("arial.ttf", font_size)
                 except:
                     try:
-                        font = ImageFont.truetype("calibri.ttf", font_size)
+                        # Fallback to different font names
+                        font = ImageFont.truetype("Arial.ttf", font_size)
                     except:
-                        # Use default font
-                        font = ImageFont.load_default()
+                        try:
+                            font = ImageFont.truetype("calibri.ttf", font_size)
+                        except:
+                            # Use default font
+                            font = ImageFont.load_default()
+                
+                # Cache the font for future use
+                self._font_cache[font_key] = font
             
             # Wrap text to fit video width
             wrapped_text = self.wrap_text_for_video(text, font, video_width * 0.9)
@@ -469,10 +535,10 @@ class StoryVideoCreator:
     def cleanup(self):
         """Clean up temporary files"""
         try:
-            import shutil
+            print(f"Cleaning up temp directory: {self.temp_dir}")
             shutil.rmtree(self.temp_dir, ignore_errors=True)
-        except:
-            pass
+        except Exception as e:
+            print(f"Warning: Could not clean up temp directory: {e}")
     
     def split_video_into_segments(self, video_path: str, segment_duration: int) -> str:
         """
@@ -625,41 +691,37 @@ def main():
         os.makedirs(output_dir)
     
     # Create the story video
-    creator = StoryVideoCreator(args.piper_path, args.voice_model)
-    
-    try:
-        print("=== Story Video Creator ===")
-        print(f"Story file: {args.story_file}")
-        print(f"Video folder: {args.video_folder}")
-        print(f"Output file: {args.output_file}")
-        print(f"Subtitles: {'Disabled' if args.no_subtitles else 'Enabled'}")
-        if args.segment_duration:
-            print(f"Segment duration: {args.segment_duration} seconds")
-        print()
-        
-        result = creator.create_story_video(
-            args.story_file, 
-            args.video_folder, 
-            args.output_file,
-            add_subtitles=not args.no_subtitles,
-            segment_duration=args.segment_duration
-        )
-        
-        print()
-        print("=== SUCCESS ===")
-        if args.segment_duration:
-            print(f"Story video segments created successfully in: {result}")
-        else:
-            print(f"Story video created successfully: {result}")
-        
-    except Exception as e:
-        print()
-        print("=== ERROR ===")
-        print(f"Failed to create story video: {e}")
-        sys.exit(1)
-    
-    finally:
-        creator.cleanup()
+    with StoryVideoCreator(args.piper_path, args.voice_model) as creator:
+        try:
+            print("=== Story Video Creator ===")
+            print(f"Story file: {args.story_file}")
+            print(f"Video folder: {args.video_folder}")
+            print(f"Output file: {args.output_file}")
+            print(f"Subtitles: {'Disabled' if args.no_subtitles else 'Enabled'}")
+            if args.segment_duration:
+                print(f"Segment duration: {args.segment_duration} seconds")
+            print()
+            
+            result = creator.create_story_video(
+                args.story_file, 
+                args.video_folder, 
+                args.output_file,
+                add_subtitles=not args.no_subtitles,
+                segment_duration=args.segment_duration
+            )
+            
+            print()
+            print("=== SUCCESS ===")
+            if args.segment_duration:
+                print(f"Story video segments created successfully in: {result}")
+            else:
+                print(f"Story video created successfully: {result}")
+            
+        except Exception as e:
+            print()
+            print("=== ERROR ===")
+            print(f"Failed to create story video: {e}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

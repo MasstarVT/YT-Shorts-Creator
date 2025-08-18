@@ -3,3 +3,26 @@ voices/
 stories/
 output/
 backgrounds/
+
+# Ignore temporary files and directories
+temp/
+tmp/
+temp-*/
+story_video_*/
+*.tmp
+temp-audio*.m4a
+temp-audio*.wav
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Ignore OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
